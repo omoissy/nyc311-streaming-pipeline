@@ -19,9 +19,15 @@ json_field() {
   python3 -c "import json, sys; print(json.load(sys.stdin)$1)"
 }
 
+# Read cqlsh's whole output before parsing it. Piping straight into `awk ... exit` let
+# awk close the pipe while cqlsh was still printing warnings; under pipefail that
+# failed the pipeline and `set -e` killed the script. A failed query prints nothing,
+# which the caller treats as "not ready yet".
 cql_count() {
-  "${compose[@]}" exec -T cassandra cqlsh -e "SELECT COUNT(*) FROM nyc311_streams.$1;" 2>/dev/null \
-    | awk '/^[[:space:]]*[0-9]+[[:space:]]*$/ {print $1; exit}'
+  local out
+  out=$("${compose[@]}" exec -T cassandra cqlsh -e "SELECT COUNT(*) FROM nyc311_streams.$1;" 2>/dev/null) \
+    || return 0
+  awk '/^[[:space:]]*[0-9]+[[:space:]]*$/ {print $1; exit}' <<<"$out"
 }
 
 wait_for() {
@@ -58,7 +64,8 @@ api -X POST "$airflow_url/api/v1/dags/$dag_id/dagRuns" \
 
 state=queued
 for attempt in $(seq 1 90); do
-  state=$(api "$airflow_url/api/v1/dags/$dag_id/dagRuns/$run_id" | json_field '["state"]')
+  state=$(api "$airflow_url/api/v1/dags/$dag_id/dagRuns/$run_id" | json_field '["state"]') \
+    || state=unknown  # a transient API error is retried, not fatal
   [[ "$state" == "success" || "$state" == "failed" ]] && break
   echo "DAG run ${run_id} is ${state} (${attempt}/90)"
   sleep 5
