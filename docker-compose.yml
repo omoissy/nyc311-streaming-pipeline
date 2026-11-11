@@ -1,0 +1,283 @@
+name: realtime-pipeline
+
+# ---------------------------------------------------------------------------
+# Shared definitions
+# ---------------------------------------------------------------------------
+x-airflow-common: &airflow-common
+  build: ./airflow
+  image: realtime-pipeline/airflow:2.10.5
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:-}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY:-local-dev-secret-change-me}
+    AIRFLOW__WEBSERVER__WORKERS: "2"
+    PYTHONPATH: /opt/airflow/src
+    KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    KAFKA_TOPIC: ${KAFKA_TOPIC:-users_created}
+    KAFKA_DLQ_TOPIC: ${KAFKA_DLQ_TOPIC:-users_created_dlq}
+    STREAM_DURATION_SECONDS: ${STREAM_DURATION_SECONDS:-60}
+    API_BATCH_SIZE: ${API_BATCH_SIZE:-10}
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./src:/opt/airflow/src
+    - airflow-logs:/opt/airflow/logs
+  depends_on: &airflow-depends-on
+    postgres:
+      condition: service_healthy
+
+x-spark-common: &spark-common
+  build: ./spark
+  image: realtime-pipeline/spark:3.5.5
+  volumes:
+    - spark-checkpoints:/opt/spark-checkpoints
+
+services:
+  # -------------------------------------------------------------------------
+  # Orchestration: Airflow (LocalExecutor) + Postgres metadata DB
+  # -------------------------------------------------------------------------
+  postgres:
+    image: postgres:16.6
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  airflow-init:
+    <<: *airflow-common
+    command: version
+    environment:
+      <<: *airflow-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USER:-airflow}
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:-airflow}
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+      kafka-init:
+        condition: service_completed_successfully
+
+  # -------------------------------------------------------------------------
+  # Messaging: Kafka in KRaft mode (no ZooKeeper) + topic bootstrap + UI
+  # -------------------------------------------------------------------------
+  kafka:
+    image: apache/kafka:3.9.1
+    hostname: kafka
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      CLUSTER_ID: OHQyYxwcRCarf1CpCoYCvw
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 20s
+    restart: unless-stopped
+
+  kafka-init:
+    image: apache/kafka:3.9.1
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        topics=/opt/kafka/bin/kafka-topics.sh
+        $$topics --bootstrap-server kafka:29092 --create --if-not-exists \
+          --topic ${KAFKA_TOPIC:-users_created} --partitions 3 --replication-factor 1
+        $$topics --bootstrap-server kafka:29092 --create --if-not-exists \
+          --topic ${KAFKA_DLQ_TOPIC:-users_created_dlq} --partitions 1 --replication-factor 1
+        $$topics --bootstrap-server kafka:29092 --describe
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    ports:
+      - "8085:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: realtime-pipeline
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------------
+  # Processing: Spark standalone cluster + the streaming driver
+  # -------------------------------------------------------------------------
+  spark-master:
+    <<: *spark-common
+    hostname: spark-master
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master --host spark-master --port 7077 --webui-port 8080
+    ports:
+      - "9090:8080"
+      - "7077:7077"
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080', timeout=5)\""]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+    restart: unless-stopped
+
+  spark-worker:
+    <<: *spark-common
+    hostname: spark-worker
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077 --cores 2 --memory 1g --webui-port 8081
+    ports:
+      - "8081:8081"
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8081', timeout=5)\""]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    restart: unless-stopped
+
+  spark-streaming:
+    <<: *spark-common
+    hostname: spark-streaming
+    command:
+      - /opt/spark/bin/spark-submit
+      - --master
+      - spark://spark-master:7077
+      - --deploy-mode
+      - client
+      - --conf
+      - spark.driver.host=spark-streaming
+      - --conf
+      - spark.driver.bindAddress=0.0.0.0
+      - --conf
+      - spark.driver.memory=768m
+      - --conf
+      - spark.executor.memory=768m
+      - --conf
+      - spark.cores.max=2
+      - --conf
+      - spark.sql.shuffle.partitions=4
+      - /opt/spark-apps/stream_to_cassandra.py
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-users_created}
+      CASSANDRA_HOST: cassandra
+      CASSANDRA_KEYSPACE: spark_streams
+      CHECKPOINT_DIR: /opt/spark-checkpoints/users_to_cassandra
+      TRIGGER_INTERVAL: ${TRIGGER_INTERVAL:-10 seconds}
+    ports:
+      - "4040:4040"
+    depends_on:
+      spark-worker:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      cassandra-init:
+        condition: service_completed_successfully
+    # The query resumes from its checkpoint after a crash, so restarting is safe.
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------------
+  # Storage: Cassandra + schema bootstrap
+  # -------------------------------------------------------------------------
+  cassandra:
+    image: cassandra:4.1.8
+    hostname: cassandra
+    ports:
+      - "9042:9042"
+    environment:
+      CASSANDRA_CLUSTER_NAME: realtime-pipeline
+      MAX_HEAP_SIZE: 512M
+      HEAP_NEWSIZE: 128M
+    volumes:
+      - cassandra-data:/var/lib/cassandra
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh -e 'DESCRIBE KEYSPACES' > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 60s
+    restart: unless-stopped
+
+  cassandra-init:
+    image: cassandra:4.1.8
+    depends_on:
+      cassandra:
+        condition: service_healthy
+    volumes:
+      - ./cassandra/schema.cql:/schema.cql:ro
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        for attempt in $$(seq 1 30); do
+          cqlsh cassandra -f /schema.cql && echo "schema applied" && exit 0
+          echo "cassandra not ready (attempt $$attempt), retrying in 5s"
+          sleep 5
+        done
+        exit 1
+
+volumes:
+  postgres-data:
+  airflow-logs:
+  kafka-data:
+  cassandra-data:
+  spark-checkpoints:

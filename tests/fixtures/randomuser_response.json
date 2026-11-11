@@ -1,0 +1,56 @@
+{
+  "results": [
+    {
+      "gender": "female",
+      "name": {"title": "Mrs", "first": "Emma", "last": "Johansen"},
+      "location": {
+        "street": {"number": 4587, "name": "Teglværksvej"},
+        "city": "Rønnede",
+        "state": "Midtjylland",
+        "country": "Denmark",
+        "postcode": 63718,
+        "coordinates": {"latitude": "-46.7899", "longitude": "82.0406"},
+        "timezone": {"offset": "-3:00", "description": "Brazil, Buenos Aires, Georgetown"}
+      },
+      "email": "Emma.Johansen@example.com",
+      "login": {
+        "uuid": "44957db7-9c04-4cff-8020-85aa39e37b4b",
+        "username": "beautifulleopard431",
+        "password": "brutus"
+      },
+      "dob": {"date": "1982-06-24T23:39:34.775Z", "age": 44},
+      "registered": {"date": "2015-04-07T18:30:40.908Z", "age": 11},
+      "phone": "58147274",
+      "cell": "61956005",
+      "id": {"name": "CPR", "value": "240682-5610"},
+      "picture": {
+        "large": "https://randomuser.me/api/portraits/women/20.jpg",
+        "medium": "https://randomuser.me/api/portraits/med/women/20.jpg",
+        "thumbnail": "https://randomuser.me/api/portraits/thumb/women/20.jpg"
+      },
+      "nat": "DK"
+    },
+    {
+      "gender": "male",
+      "name": {"title": "Mr", "first": "Oscar", "last": "Wilson"},
+      "location": {
+        "street": {"number": 4314, "name": "Alexander Road"},
+        "city": "Salisbury",
+        "state": "Grampian",
+        "country": "United Kingdom",
+        "postcode": "GE78 5SE"
+      },
+      "email": "oscar.wilson@example.com",
+      "login": {
+        "uuid": "0f3c2a9e-6b1d-4e57-9c8a-2d4b6f8e1a30",
+        "username": "goldenswan118"
+      },
+      "dob": {"date": "1975-01-02T03:04:05.006Z", "age": 51},
+      "registered": {"date": "2010-10-10T10:10:10.100Z", "age": 16},
+      "phone": "017683 12345",
+      "picture": {"medium": "https://randomuser.me/api/portraits/med/men/14.jpg"},
+      "nat": "GB"
+    }
+  ],
+  "info": {"seed": "fixture", "results": 2, "page": 1, "version": "1.4"}
+}
