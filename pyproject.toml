@@ -3,13 +3,14 @@ requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "realtime-data-streaming-pipeline"
-version = "1.0.0"
-description = "Airflow, Kafka, Spark Structured Streaming and Cassandra user-profile pipeline"
+name = "nyc311-streaming-pipeline"
+version = "2.0.0"
+description = "Real NYC 311 data pipeline with Airflow, Kafka, Spark and Cassandra"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "confluent-kafka==2.8.0",
+  "psycopg2-binary==2.9.10",
   "requests==2.32.3",
 ]
 

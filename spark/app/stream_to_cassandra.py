@@ -1,10 +1,4 @@
-"""Spark Structured Streaming job: Kafka -> validated, typed rows -> Cassandra.
-
-Valid records are upserted into `created_users`, keyed by user id, so replaying a
-micro-batch after a failure rewrites the same rows instead of duplicating them.
-Records that fail parsing or validation go to `rejected_records` with the reason and
-their Kafka coordinates, so nothing is silently dropped.
-"""
+"""Spark Structured Streaming job: Kafka NYC 311 events -> Cassandra."""
 
 from __future__ import annotations
 
@@ -16,52 +10,59 @@ from functools import partial
 from pyspark.sql import Column, DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.streaming import StreamingQueryListener
-from pyspark.sql.types import IntegerType, StringType, StructField, StructType
+from pyspark.sql.types import DoubleType, IntegerType, StringType, StructField, StructType
 
-log = logging.getLogger("stream_to_cassandra")
+log = logging.getLogger("nyc311_to_cassandra")
 
 CORRUPT_RECORD = "_corrupt_record"
 UUID_PATTERN = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
-EMAIL_PATTERN = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
 
-# Message contract produced by src/user_stream/transform.py.
-USER_SCHEMA = StructType(
+REQUEST_SCHEMA = StructType(
     [
         StructField("schema_version", IntegerType()),
-        StructField("id", StringType()),
-        StructField("first_name", StringType()),
-        StructField("last_name", StringType()),
-        StructField("gender", StringType()),
-        StructField("address", StringType()),
-        StructField("post_code", StringType()),
-        StructField("email", StringType()),
-        StructField("username", StringType()),
-        StructField("dob", StringType()),
-        StructField("registered_date", StringType()),
-        StructField("phone", StringType()),
-        StructField("picture", StringType()),
-        StructField("nationality", StringType()),
+        StructField("unique_key", StringType()),
+        StructField("created_date", StringType()),
+        StructField("closed_date", StringType()),
+        StructField("agency", StringType()),
+        StructField("agency_name", StringType()),
+        StructField("complaint_type", StringType()),
+        StructField("descriptor", StringType()),
+        StructField("location_type", StringType()),
+        StructField("incident_zip", StringType()),
+        StructField("city", StringType()),
+        StructField("borough", StringType()),
+        StructField("status", StringType()),
+        StructField("due_date", StringType()),
+        StructField("resolution_description", StringType()),
+        StructField("latitude", DoubleType()),
+        StructField("longitude", DoubleType()),
+        StructField("community_board", StringType()),
+        StructField("council_district", StringType()),
         StructField("event_time", StringType()),
         StructField(CORRUPT_RECORD, StringType()),
     ]
 )
-REQUIRED_FIELDS = ("id", "first_name", "last_name", "email")
+REQUIRED_FIELDS = ("unique_key", "created_date", "agency", "complaint_type", "status")
 
-# Column order of the Cassandra tables in cassandra/schema.cql.
-USER_COLUMNS = [
-    "id",
-    "first_name",
-    "last_name",
-    "gender",
-    "address",
-    "post_code",
-    "email",
-    "username",
-    "dob",
-    "registered_date",
-    "phone",
-    "picture",
-    "nationality",
+REQUEST_COLUMNS = [
+    "unique_key",
+    "created_date",
+    "closed_date",
+    "agency",
+    "agency_name",
+    "complaint_type",
+    "descriptor",
+    "location_type",
+    "incident_zip",
+    "city",
+    "borough",
+    "status",
+    "due_date",
+    "resolution_description",
+    "latitude",
+    "longitude",
+    "community_board",
+    "council_district",
     "event_time",
     "kafka_partition",
     "kafka_offset",
@@ -81,13 +82,13 @@ REJECTED_COLUMNS = [
 @dataclass(frozen=True)
 class JobConfig:
     kafka_bootstrap_servers: str = "kafka:29092"
-    topic: str = "users_created"
+    topic: str = "nyc311_requests"
     starting_offsets: str = "earliest"
     max_offsets_per_trigger: int = 5000
     cassandra_host: str = "cassandra"
     cassandra_port: int = 9042
-    keyspace: str = "spark_streams"
-    checkpoint_dir: str = "/opt/spark-checkpoints/users_to_cassandra"
+    keyspace: str = "nyc311_streams"
+    checkpoint_dir: str = "/opt/spark-checkpoints/nyc311_to_cassandra"
     trigger_interval: str = "10 seconds"
 
     @classmethod
@@ -109,7 +110,6 @@ class JobConfig:
 
 
 def _validation_error(data: Column) -> Column:
-    """Null for a valid record, otherwise a short machine-readable reason."""
     missing = F.array_compact(
         F.array(
             *[
@@ -122,13 +122,11 @@ def _validation_error(data: Column) -> Column:
         F.when(F.col("raw_value").isNull(), F.lit("empty_message"))
         .when(data[CORRUPT_RECORD].isNotNull(), F.lit("malformed_json"))
         .when(F.size(missing) > 0, F.concat(F.lit("missing_fields:"), F.array_join(missing, ",")))
-        .when(~F.lower(F.trim(data["id"])).rlike(UUID_PATTERN), F.lit("invalid_id"))
-        .when(~F.trim(data["email"]).rlike(EMAIL_PATTERN), F.lit("invalid_email"))
+        .when(F.to_timestamp(data["created_date"]).isNull(), F.lit("invalid_created_date"))
     )
 
 
-def parse_users(kafka_df: DataFrame) -> DataFrame:
-    """Kafka source rows -> typed user columns plus an `error` column (null when valid)."""
+def parse_requests(kafka_df: DataFrame) -> DataFrame:
     data = F.col("data")
     decoded = kafka_df.select(
         F.col("value").cast("string").alias("raw_value"),
@@ -139,7 +137,7 @@ def parse_users(kafka_df: DataFrame) -> DataFrame:
         "data",
         F.from_json(
             "raw_value",
-            USER_SCHEMA,
+            REQUEST_SCHEMA,
             {"mode": "PERMISSIVE", "columnNameOfCorruptRecord": CORRUPT_RECORD},
         ),
     )
@@ -149,28 +147,33 @@ def parse_users(kafka_df: DataFrame) -> DataFrame:
         "kafka_offset",
         "kafka_timestamp",
         _validation_error(data).alias("error"),
-        F.lower(F.trim(data["id"])).alias("id"),
-        F.trim(data["first_name"]).alias("first_name"),
-        F.trim(data["last_name"]).alias("last_name"),
-        data["gender"].alias("gender"),
-        data["address"].alias("address"),
-        data["post_code"].alias("post_code"),
-        F.lower(F.trim(data["email"])).alias("email"),
-        data["username"].alias("username"),
-        F.to_timestamp(data["dob"]).alias("dob"),
-        F.to_timestamp(data["registered_date"]).alias("registered_date"),
-        data["phone"].alias("phone"),
-        data["picture"].alias("picture"),
-        data["nationality"].alias("nationality"),
+        F.trim(data["unique_key"]).alias("unique_key"),
+        F.to_timestamp(data["created_date"]).alias("created_date"),
+        F.to_timestamp(data["closed_date"]).alias("closed_date"),
+        F.trim(data["agency"]).alias("agency"),
+        data["agency_name"].alias("agency_name"),
+        F.trim(data["complaint_type"]).alias("complaint_type"),
+        data["descriptor"].alias("descriptor"),
+        data["location_type"].alias("location_type"),
+        data["incident_zip"].alias("incident_zip"),
+        data["city"].alias("city"),
+        data["borough"].alias("borough"),
+        F.trim(data["status"]).alias("status"),
+        F.to_timestamp(data["due_date"]).alias("due_date"),
+        data["resolution_description"].alias("resolution_description"),
+        data["latitude"].alias("latitude"),
+        data["longitude"].alias("longitude"),
+        data["community_board"].alias("community_board"),
+        data["council_district"].alias("council_district"),
         F.to_timestamp(data["event_time"]).alias("event_time"),
     )
 
 
-def valid_users(parsed: DataFrame) -> DataFrame:
+def valid_requests(parsed: DataFrame) -> DataFrame:
     return (
         parsed.filter(F.col("error").isNull())
         .withColumn("ingested_at", F.current_timestamp())
-        .select(*USER_COLUMNS)
+        .select(*REQUEST_COLUMNS)
     )
 
 
@@ -195,15 +198,18 @@ def _save(df: DataFrame, keyspace: str, table: str) -> None:
 def write_batch(batch_df: DataFrame, batch_id: int, keyspace: str) -> None:
     batch_df.persist()
     try:
-        users = valid_users(batch_df)
+        requests = valid_requests(batch_df)
         rejected = rejected_records(batch_df)
-        user_count, rejected_count = users.count(), rejected.count()
-        if user_count:
-            _save(users, keyspace, "created_users")
+        request_count, rejected_count = requests.count(), rejected.count()
+        if request_count:
+            _save(requests, keyspace, "service_requests")
         if rejected_count:
             _save(rejected, keyspace, "rejected_records")
         log.info(
-            "batch %d: %d users upserted, %d records rejected", batch_id, user_count, rejected_count
+            "batch %d: %d NYC 311 requests written, %d records rejected",
+            batch_id,
+            request_count,
+            rejected_count,
         )
     finally:
         batch_df.unpersist()
@@ -236,7 +242,7 @@ class ProgressLogger(StreamingQueryListener):
 
 def build_spark(config: JobConfig) -> SparkSession:
     return (
-        SparkSession.builder.appName("users-kafka-to-cassandra")
+        SparkSession.builder.appName("nyc311-kafka-to-cassandra")
         .config("spark.sql.session.timeZone", "UTC")
         .config("spark.cassandra.connection.host", config.cassandra_host)
         .config("spark.cassandra.connection.port", str(config.cassandra_port))
@@ -250,25 +256,21 @@ def main() -> None:
     )
     config = JobConfig.from_env()
     log.info("starting with %s", config)
-
     spark = build_spark(config)
     spark.sparkContext.setLogLevel("WARN")
     spark.streams.addListener(ProgressLogger())
-
     kafka_df = (
         spark.readStream.format("kafka")
         .option("kafka.bootstrap.servers", config.kafka_bootstrap_servers)
         .option("subscribe", config.topic)
         .option("startingOffsets", config.starting_offsets)
         .option("maxOffsetsPerTrigger", config.max_offsets_per_trigger)
-        # Don't crash if retention deleted offsets the checkpoint still points at.
-        .option("failOnDataLoss", "false")
+        .option("failOnDataLoss", "true")
         .load()
     )
-
     query = (
-        parse_users(kafka_df)
-        .writeStream.queryName("users_to_cassandra")
+        parse_requests(kafka_df)
+        .writeStream.queryName("nyc311_to_cassandra")
         .foreachBatch(partial(write_batch, keyspace=config.keyspace))
         .option("checkpointLocation", config.checkpoint_dir)
         .trigger(processingTime=config.trigger_interval)

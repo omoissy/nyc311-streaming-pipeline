@@ -3,10 +3,10 @@ from __future__ import annotations
 import json
 
 import pytest
-import requests
 
-from user_stream.config import Settings
-from user_stream.producer import stream_users
+from nyc311_stream.config import Settings
+from nyc311_stream.nyc311 import latest_cursor
+from nyc311_stream.producer import run_ingestion, stream_requests
 
 
 class FakeMessage:
@@ -37,195 +37,74 @@ class FakeProducer:
 
 
 class FakeClient:
-    def __init__(self, users):
-        self.users = users
-        self.calls = []
+    def __init__(self, records):
+        self.records = records
 
-    def fetch_users(self, count):
-        self.calls.append(count)
-        return self.users
+    def fetch_requests(self, _cursor, *, limit, initial_lookback_hours):
+        assert limit > 0
+        assert initial_lookback_hours > 0
+        return self.records
 
 
-def test_stream_users_sends_valid_records_and_dlq(raw_user):
-    invalid = {"email": "bad", "login": {"uuid": "not-a-uuid"}}
-    settings = Settings(fetch_interval_seconds=0, stream_duration_seconds=1)
-    client = FakeClient([raw_user, invalid])
+class FakeStore:
+    def __init__(self):
+        self.cursor = None
+        self.runs = []
+
+    def ensure_schema(self):
+        pass
+
+    def get_cursor(self, _source_name):
+        return self.cursor
+
+    def save_cursor(self, _source_name, cursor):
+        self.cursor = cursor
+
+    def record_run(self, values):
+        self.runs.append(values)
+
+
+def test_stream_requests_publishes_valid_and_dlq_records(raw_requests):
+    settings = Settings()
     producer = FakeProducer()
-    now = iter([0.0, 0.0, 2.0])
+    bad = {"unique_key": "70000003", "created_date": "bad"}
 
-    stats = stream_users(client, producer, settings, clock=lambda: next(now), sleep=lambda _: None)
+    stats, cursor = stream_requests(
+        FakeClient([raw_requests[0], bad]), producer, settings, cursor=None
+    )
 
     assert stats.fetched == 2
     assert stats.produced == 1
     assert stats.dead_lettered == 1
     assert stats.delivered == 2
-    assert stats.delivery_failures == 0
+    assert cursor.unique_key == "70000001"
     assert producer.messages[0][0] == settings.topic
+    assert producer.messages[0][1] == "70000001"
     assert producer.messages[1][0] == settings.dlq_topic
+    assert json.loads(producer.messages[1][2])["payload"] == bad
 
 
-def test_stream_users_fails_after_consecutive_api_errors():
-    class FailingClient:
-        def fetch_users(self, _count):
-            raise requests.ConnectionError("network down")
+def test_run_ingestion_persists_cursor_and_audit(raw_requests):
+    settings = Settings()
+    store = FakeStore()
 
-    settings = Settings(max_consecutive_api_failures=1)
-    producer = FakeProducer()
-
-    with pytest.raises(RuntimeError, match="failed 1 times"):
-        stream_users(FailingClient(), producer, settings, duration_seconds=1, clock=lambda: 0)
-
-
-class FakeClock:
-    """Monotonic clock that only advances when the code under test sleeps."""
-
-    def __init__(self):
-        self.now = 0.0
-        self.sleeps = []
-
-    def __call__(self):
-        return self.now
-
-    def sleep(self, seconds):
-        self.sleeps.append(seconds)
-        self.now += seconds
-
-
-def test_messages_are_keyed_by_user_id_and_json_encoded(raw_users):
-    settings = Settings(fetch_interval_seconds=1, stream_duration_seconds=1)
-    producer = FakeProducer()
-    clock = FakeClock()
-
-    stream_users(FakeClient(raw_users), producer, settings, clock=clock, sleep=clock.sleep)
-
-    keys = [key for _, key, _ in producer.messages]
-    assert keys == [
-        "44957db7-9c04-4cff-8020-85aa39e37b4b",
-        "0f3c2a9e-6b1d-4e57-9c8a-2d4b6f8e1a30",
-    ]
-    first = json.loads(producer.messages[0][2])
-    assert first["id"] == keys[0]
-    assert first["schema_version"] == 1
-
-
-def test_dead_letter_carries_reason_and_original_payload():
-    settings = Settings(fetch_interval_seconds=1, stream_duration_seconds=1)
-    producer = FakeProducer()
-    clock = FakeClock()
-    bad = {"login": {"uuid": "nope"}, "email": "x@example.com"}
-
-    stream_users(FakeClient([bad]), producer, settings, clock=clock, sleep=clock.sleep)
-
-    [(topic, key, value)] = producer.messages
-    assert topic == settings.dlq_topic
-    assert key is None
-    dead_letter = json.loads(value)
-    assert "not a valid UUID" in dead_letter["error"]
-    assert dead_letter["payload"] == bad
-
-
-def test_transient_api_failure_is_retried(raw_user):
-    class FlakyClient:
-        def __init__(self):
-            self.calls = 0
-
-        def fetch_users(self, _count):
-            self.calls += 1
-            if self.calls == 1:
-                raise requests.Timeout("slow API")
-            return [raw_user]
-
-    settings = Settings(fetch_interval_seconds=1, stream_duration_seconds=3)
-    clock = FakeClock()
-
-    stats = stream_users(FlakyClient(), FakeProducer(), settings, clock=clock, sleep=clock.sleep)
-
-    assert stats.api_failures == 1
-    assert stats.produced >= 1
-    assert clock.sleeps[0] == 2  # exponential backoff after the first failure
-
-
-def test_failed_delivery_fails_the_run(raw_user):
-    class RejectingProducer(FakeProducer):
-        def produce(self, topic, key, value, on_delivery):
-            self.messages.append((topic, key, value))
-            on_delivery("broker unavailable", FakeMessage(topic, key))
-
-    settings = Settings(fetch_interval_seconds=1, stream_duration_seconds=1)
-    clock = FakeClock()
-
-    with pytest.raises(RuntimeError, match="1 messages failed delivery"):
-        stream_users(
-            FakeClient([raw_user]), RejectingProducer(), settings, clock=clock, sleep=clock.sleep
-        )
-
-
-def test_undelivered_messages_after_flush_fail_the_run(raw_user):
-    class StuckProducer(FakeProducer):
-        def flush(self, _timeout):
-            return 3
-
-    settings = Settings(fetch_interval_seconds=1, stream_duration_seconds=1)
-    clock = FakeClock()
-
-    with pytest.raises(RuntimeError, match="3 messages still undelivered"):
-        stream_users(
-            FakeClient([raw_user]), StuckProducer(), settings, clock=clock, sleep=clock.sleep
-        )
-
-
-def test_full_local_queue_is_drained_and_retried(raw_user):
-    class BusyProducer(FakeProducer):
-        def __init__(self):
-            super().__init__()
-            self.polls = []
-            self.rejections = 2
-
-        def produce(self, topic, key, value, on_delivery):
-            if self.rejections:
-                self.rejections -= 1
-                raise BufferError("queue full")
-            super().produce(topic, key, value, on_delivery)
-
-        def poll(self, timeout):
-            self.polls.append(timeout)
-            return 0
-
-    settings = Settings(fetch_interval_seconds=1, stream_duration_seconds=1)
-    producer = BusyProducer()
-    clock = FakeClock()
-
-    stats = stream_users(
-        FakeClient([raw_user]), producer, settings, clock=clock, sleep=clock.sleep
+    result = run_ingestion(
+        settings,
+        client=FakeClient(raw_requests),
+        producer=FakeProducer(),
+        store=store,
     )
 
-    assert stats.delivered == 1
-    assert producer.polls.count(1) == 2
+    assert result["produced"] == 2
+    assert store.cursor == latest_cursor(raw_requests)
+    assert store.runs[0]["status"] == "success"
+    assert store.runs[0]["cursor_after"] == latest_cursor(raw_requests)
 
 
-@pytest.mark.parametrize(
-    "overrides",
-    [
-        {"topic": "same", "dlq_topic": "same"},
-        {"batch_size": 0},
-        {"bootstrap_servers": " "},
-        {"stream_duration_seconds": 0},
-    ],
-)
-def test_invalid_settings_are_rejected(overrides):
+@pytest.mark.parametrize("field", ["topic", "dlq_topic", "pipeline_db_url"])
+def test_settings_are_required(field):
+    overrides = {field: ""}
+    if field == "topic":
+        overrides["topic"] = ""
     with pytest.raises(ValueError):
         Settings(**overrides)
-
-
-def test_settings_read_from_environment(monkeypatch):
-    monkeypatch.setenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
-    monkeypatch.setenv("KAFKA_TOPIC", "users_test")
-    monkeypatch.setenv("API_BATCH_SIZE", "25")
-    monkeypatch.setenv("STREAM_DURATION_SECONDS", "")  # empty falls back to the default
-
-    settings = Settings.from_env()
-
-    assert settings.bootstrap_servers == "localhost:9092"
-    assert settings.topic == "users_test"
-    assert settings.batch_size == 25
-    assert settings.stream_duration_seconds == Settings.stream_duration_seconds

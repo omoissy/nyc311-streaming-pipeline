@@ -1,11 +1,11 @@
-name: realtime-pipeline
+name: nyc311-pipeline
 
 # ---------------------------------------------------------------------------
 # Shared definitions
 # ---------------------------------------------------------------------------
 x-airflow-common: &airflow-common
   build: ./airflow
-  image: realtime-pipeline/airflow:2.10.5
+  image: nyc311-pipeline/airflow:2.10.5
   environment: &airflow-env
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
@@ -18,10 +18,12 @@ x-airflow-common: &airflow-common
     AIRFLOW__WEBSERVER__WORKERS: "2"
     PYTHONPATH: /opt/airflow/src
     KAFKA_BOOTSTRAP_SERVERS: kafka:29092
-    KAFKA_TOPIC: ${KAFKA_TOPIC:-users_created}
-    KAFKA_DLQ_TOPIC: ${KAFKA_DLQ_TOPIC:-users_created_dlq}
-    STREAM_DURATION_SECONDS: ${STREAM_DURATION_SECONDS:-60}
-    API_BATCH_SIZE: ${API_BATCH_SIZE:-10}
+    KAFKA_TOPIC: ${KAFKA_TOPIC:-nyc311_requests}
+    KAFKA_DLQ_TOPIC: ${KAFKA_DLQ_TOPIC:-nyc311_requests_dlq}
+    API_BATCH_SIZE: ${API_BATCH_SIZE:-100}
+    MAX_RECORDS_PER_RUN: ${MAX_RECORDS_PER_RUN:-500}
+    INITIAL_LOOKBACK_HOURS: ${INITIAL_LOOKBACK_HOURS:-168}
+    PIPELINE_DB_URL: postgresql://airflow:airflow@postgres/airflow
   volumes:
     - ./dags:/opt/airflow/dags
     - ./src:/opt/airflow/src
@@ -32,7 +34,7 @@ x-airflow-common: &airflow-common
 
 x-spark-common: &spark-common
   build: ./spark
-  image: realtime-pipeline/spark:3.5.5
+  image: nyc311-pipeline/spark:3.5.5
   volumes:
     - spark-checkpoints:/opt/spark-checkpoints
 
@@ -145,9 +147,9 @@ services:
         set -e
         topics=/opt/kafka/bin/kafka-topics.sh
         $$topics --bootstrap-server kafka:29092 --create --if-not-exists \
-          --topic ${KAFKA_TOPIC:-users_created} --partitions 3 --replication-factor 1
+          --topic ${KAFKA_TOPIC:-nyc311_requests} --partitions 3 --replication-factor 1
         $$topics --bootstrap-server kafka:29092 --create --if-not-exists \
-          --topic ${KAFKA_DLQ_TOPIC:-users_created_dlq} --partitions 1 --replication-factor 1
+          --topic ${KAFKA_DLQ_TOPIC:-nyc311_requests_dlq} --partitions 1 --replication-factor 1
         $$topics --bootstrap-server kafka:29092 --describe
 
   kafka-ui:
@@ -155,7 +157,7 @@ services:
     ports:
       - "8085:8080"
     environment:
-      KAFKA_CLUSTERS_0_NAME: realtime-pipeline
+      KAFKA_CLUSTERS_0_NAME: nyc311-pipeline
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
     depends_on:
       kafka:
@@ -219,10 +221,10 @@ services:
       - /opt/spark-apps/stream_to_cassandra.py
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
-      KAFKA_TOPIC: ${KAFKA_TOPIC:-users_created}
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-nyc311_requests}
       CASSANDRA_HOST: cassandra
-      CASSANDRA_KEYSPACE: spark_streams
-      CHECKPOINT_DIR: /opt/spark-checkpoints/users_to_cassandra
+      CASSANDRA_KEYSPACE: nyc311_streams
+      CHECKPOINT_DIR: /opt/spark-checkpoints/nyc311_to_cassandra
       TRIGGER_INTERVAL: ${TRIGGER_INTERVAL:-10 seconds}
     ports:
       - "4040:4040"
@@ -245,7 +247,7 @@ services:
     ports:
       - "9042:9042"
     environment:
-      CASSANDRA_CLUSTER_NAME: realtime-pipeline
+      CASSANDRA_CLUSTER_NAME: nyc311-pipeline
       MAX_HEAP_SIZE: 512M
       HEAP_NEWSIZE: 128M
     volumes:

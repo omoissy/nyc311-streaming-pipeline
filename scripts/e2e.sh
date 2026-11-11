@@ -4,7 +4,7 @@
 set -euo pipefail
 
 compose=(docker compose)
-dag_id=user_profiles_stream
+dag_id=nyc311_stream
 airflow_url=${AIRFLOW_URL:-http://localhost:8080}
 airflow_auth="${AIRFLOW_ADMIN_USER:-airflow}:${AIRFLOW_ADMIN_PASSWORD:-airflow}"
 duration=${E2E_DURATION_SECONDS:-15}
@@ -18,7 +18,7 @@ json_field() {
 }
 
 cql_count() {
-  "${compose[@]}" exec -T cassandra cqlsh -e "SELECT COUNT(*) FROM spark_streams.$1;" 2>/dev/null \
+  "${compose[@]}" exec -T cassandra cqlsh -e "SELECT COUNT(*) FROM nyc311_streams.$1;" 2>/dev/null \
     | awk '/^[[:space:]]*[0-9]+[[:space:]]*$/ {print $1; exit}'
 }
 
@@ -71,13 +71,13 @@ fi
 echo "DAG run ${run_id} succeeded"
 
 for attempt in $(seq 1 60); do
-  count=$(cql_count created_users)
+  count=$(cql_count service_requests)
   if [[ "${count:-0}" =~ ^[1-9][0-9]*$ ]]; then
     echo "end-to-end check passed: ${count} user rows in Cassandra," \
       "$(cql_count rejected_records) rejected records"
     "${compose[@]}" exec -T cassandra cqlsh -e \
-      "SELECT id, first_name, last_name, email, nationality, kafka_partition, kafka_offset
-       FROM spark_streams.created_users LIMIT 5;"
+      "SELECT unique_key, complaint_type, agency, borough, status, kafka_partition, kafka_offset
+       FROM nyc311_streams.service_requests LIMIT 5;"
     exit 0
   fi
   echo "waiting for user rows in Cassandra (${attempt}/60)"

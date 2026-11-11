@@ -1,23 +1,27 @@
--- Applied by the cassandra-init service. Every statement is idempotent.
+-- NYC 311 data tables. Statements are idempotent for container restarts.
 
-CREATE KEYSPACE IF NOT EXISTS spark_streams
+CREATE KEYSPACE IF NOT EXISTS nyc311_streams
   WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1};
 
--- One row per user. Writes are upserts on id, so replayed micro-batches are harmless.
-CREATE TABLE IF NOT EXISTS spark_streams.created_users (
-  id uuid PRIMARY KEY,
-  first_name text,
-  last_name text,
-  gender text,
-  address text,
-  post_code text,
-  email text,
-  username text,
-  dob timestamp,
-  registered_date timestamp,
-  phone text,
-  picture text,
-  nationality text,
+CREATE TABLE IF NOT EXISTS nyc311_streams.service_requests (
+  unique_key text PRIMARY KEY,
+  created_date timestamp,
+  closed_date timestamp,
+  agency text,
+  agency_name text,
+  complaint_type text,
+  descriptor text,
+  location_type text,
+  incident_zip text,
+  city text,
+  borough text,
+  status text,
+  due_date timestamp,
+  resolution_description text,
+  latitude double,
+  longitude double,
+  community_board text,
+  council_district text,
   event_time timestamp,
   kafka_partition int,
   kafka_offset bigint,
@@ -25,8 +29,7 @@ CREATE TABLE IF NOT EXISTS spark_streams.created_users (
   ingested_at timestamp
 );
 
--- Messages that failed parsing or validation, addressable by their Kafka coordinates.
-CREATE TABLE IF NOT EXISTS spark_streams.rejected_records (
+CREATE TABLE IF NOT EXISTS nyc311_streams.rejected_records (
   kafka_partition int,
   kafka_offset bigint,
   raw_value text,
