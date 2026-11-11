@@ -40,6 +40,7 @@ wait_for() {
 
 wait_for "Cassandra" 60 "${compose[@]}" exec -T cassandra cqlsh -e "SELECT now() FROM system.local;"
 wait_for "Airflow webserver" 60 curl --fail --silent "$airflow_url/health"
+wait_for "dashboard" 36 curl --fail --silent "${DASHBOARD_URL:-http://localhost:8501}/_stcore/health"
 
 # The webserver can be healthy before the scheduler has parsed and registered the DAG.
 if ! wait_for "DAG ${dag_id} to be registered" 36 api "$airflow_url/api/v1/dags/$dag_id"; then

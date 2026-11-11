@@ -56,6 +56,7 @@ The e2e check waits for the stack, triggers an Airflow run for recent NYC 311 re
 | Kafka UI | http://localhost:8085 |
 | Spark master | http://localhost:9090 |
 | Spark streaming query | http://localhost:4040 |
+| Operations dashboard | http://localhost:8501 |
 
 Inspect stored events:
 
@@ -75,6 +76,16 @@ docker compose exec postgres psql -U airflow -d airflow -c \
 
 Set `NYC311_APP_TOKEN` (a free Socrata app token) for a higher API rate limit.
 
+### Operations dashboard
+
+http://localhost:8501 is a Streamlit dashboard over the same stack. It shows:
+
+- **Pipeline health:** Airflow, Kafka topics, the Spark master and the streaming job.
+- **Charts:** requests per hour (New York time, with recent still-filling hours shaded), the top complaint types, the median time to close per complaint type (with the middle 50% of closures), current status, and borough. Bar labels show each category's share of all requests.
+- **Lineage:** the Postgres refresh state, recent ingestion runs (including failures), Kafka topic sizes, and the reasons Spark rejected records.
+
+Charts read every stored request (up to `DASHBOARD_MAX_ROWS`, default 300,000) and warn if that cap cuts the read short. Closure times only count closed requests, so slow-closing types read short; the caption says so.
+
 Stop the stack with `docker compose down`. Use `docker compose down -v` to remove local state and force a full refresh of the window on the next run.
 
 ## Testing
@@ -89,9 +100,9 @@ make compose-down
 
 `RUN_LIVE_TESTS=1 python -m pytest tests/test_live_api.py` runs two opt-in checks against the real NYC API, confirming Socrata accepts the queries the client builds.
 
-The tests cover Socrata response handling, query literal format, NYC time-zone conversion across daylight saving time, keyset paging and resume, no-op runs without a new load, failed-run auditing, newest-version-wins deduplication, cursor ordering, timestamp and coordinate validation, DLQ behavior, delivery failures, Postgres state boundaries, Kafka/Spark/Cassandra schema alignment, malformed messages, and no-record-loss partitioning between valid and rejected outputs.
+The tests cover the dashboard's data preparation (New York time, shares, closure-time statistics, data-quality counts), Socrata response handling, query literal format, NYC time-zone conversion across daylight saving time, keyset paging and resume, no-op runs without a new load, failed-run auditing, newest-version-wins deduplication, cursor ordering, timestamp and coordinate validation, DLQ behavior, delivery failures, Postgres state boundaries, Kafka/Spark/Cassandra schema alignment, malformed messages, and no-record-loss partitioning between valid and rejected outputs.
 
-GitHub Actions runs lint and tests, then builds the complete 12-service Docker Compose stack and executes the end-to-end check.
+GitHub Actions runs lint and tests, then builds the complete 13-service Docker Compose stack and executes the end-to-end check.
 
 ## Project layout
 
@@ -102,6 +113,7 @@ src/nyc311_stream/       API client, cursor store, validation, Kafka producer
 spark/app/               Spark Structured Streaming parser and Cassandra writer
 cassandra/               keyspace and table definitions
 scripts/e2e.sh           end-to-end check against the running stack
+dashboard/               Streamlit operations dashboard and easy-viz charts
 tests/                   unit, Spark, Cassandra-contract, and fixture tests
 docker-compose.yml       complete local stack
 ```

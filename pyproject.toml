@@ -17,6 +17,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+  "pandas==2.2.3",
   "pyspark==3.5.5",
   "pytest==8.3.4",
   "ruff==0.8.6",
@@ -26,7 +27,7 @@ dev = [
 where = ["src"]
 
 [tool.pytest.ini_options]
-pythonpath = ["src", "spark/app"]
+pythonpath = ["src", "spark/app", "dashboard"]
 testpaths = ["tests"]
 addopts = "-q"
 markers = ["live: calls the real NYC Open Data API (set RUN_LIVE_TESTS=1)"]
@@ -38,6 +39,10 @@ exclude = [".venv", "venv"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
+
+[tool.ruff.lint.isort]
+# The repo's cassandra/ folder holds CQL, not the cassandra-driver package.
+known-third-party = ["cassandra"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["E501"]

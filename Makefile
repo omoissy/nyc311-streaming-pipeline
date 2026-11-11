@@ -1,4 +1,4 @@
-.PHONY: install test lint check compose-up compose-down e2e logs clean
+.PHONY: install test lint dashboard-check check compose-up compose-down e2e logs clean
 
 install:
 	python3 -m pip install -e .[dev]
@@ -9,7 +9,10 @@ test:
 lint:
 	python3 -m ruff check .
 
-check: lint test
+dashboard-check:
+	python3 -m compileall -q dashboard/app.py
+
+check: lint dashboard-check test
 
 compose-up:
 	docker compose up -d --build

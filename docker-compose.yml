@@ -278,6 +278,42 @@ services:
         done
         exit 1
 
+  # -------------------------------------------------------------------------
+  # Observability: Streamlit dashboard with data charts and stack health
+  # -------------------------------------------------------------------------
+  dashboard:
+    build: ./dashboard
+    image: nyc311-pipeline/dashboard:1.0
+    ports:
+      - "8501:8501"
+    environment:
+      AIRFLOW_URL: http://airflow-webserver:8080
+      AIRFLOW_ADMIN_USER: ${AIRFLOW_ADMIN_USER:-airflow}
+      AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:-airflow}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-nyc311_requests}
+      KAFKA_DLQ_TOPIC: ${KAFKA_DLQ_TOPIC:-nyc311_requests_dlq}
+      CASSANDRA_HOST: cassandra
+      CASSANDRA_KEYSPACE: nyc311_streams
+      PIPELINE_DB_URL: postgresql://airflow:airflow@postgres/airflow
+      GITHUB_REPO: omoissy/nyc311-streaming-pipeline
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-webserver:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      cassandra-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health', timeout=5)"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
 volumes:
   postgres-data:
   airflow-logs:
