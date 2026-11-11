@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # End-to-end check against a running stack (`docker compose up -d --build` first):
-# trigger the DAG, require the run to succeed, then require user rows in Cassandra.
+# trigger the DAG, require the run to succeed, then require NYC 311 rows in Cassandra.
 set -euo pipefail
 
 compose=(docker compose)
 dag_id=nyc311_stream
 airflow_url=${AIRFLOW_URL:-http://localhost:8080}
 airflow_auth="${AIRFLOW_ADMIN_USER:-airflow}:${AIRFLOW_ADMIN_PASSWORD:-airflow}"
-duration=${E2E_DURATION_SECONDS:-15}
+# Keep CI light: a few hundred real requests from the last two days.
+max_records=${E2E_MAX_RECORDS:-300}
+window_days=${E2E_REFRESH_WINDOW_DAYS:-2}
 
 api() {
   curl --fail --silent --show-error -u "$airflow_auth" -H "Content-Type: application/json" "$@"
@@ -47,10 +49,10 @@ if ! wait_for "DAG ${dag_id} to be registered" 36 api "$airflow_url/api/v1/dags/
 fi
 
 run_id="e2e_$(date +%Y%m%dT%H%M%S)"
-echo "unpausing ${dag_id} and triggering run ${run_id} (${duration}s of streaming)"
+echo "unpausing ${dag_id} and triggering run ${run_id} (up to ${max_records} records)"
 api -X PATCH "$airflow_url/api/v1/dags/$dag_id?update_mask=is_paused" -d '{"is_paused": false}' >/dev/null
 api -X POST "$airflow_url/api/v1/dags/$dag_id/dagRuns" \
-  -d "{\"dag_run_id\": \"${run_id}\", \"conf\": {\"duration_seconds\": ${duration}, \"batch_size\": 5}}" \
+  -d "{\"dag_run_id\": \"${run_id}\", \"conf\": {\"max_records\": ${max_records}, \"refresh_window_days\": ${window_days}}}" \
   >/dev/null
 
 state=queued
@@ -73,17 +75,17 @@ echo "DAG run ${run_id} succeeded"
 for attempt in $(seq 1 60); do
   count=$(cql_count service_requests)
   if [[ "${count:-0}" =~ ^[1-9][0-9]*$ ]]; then
-    echo "end-to-end check passed: ${count} user rows in Cassandra," \
+    echo "end-to-end check passed: ${count} NYC 311 requests in Cassandra," \
       "$(cql_count rejected_records) rejected records"
     "${compose[@]}" exec -T cassandra cqlsh -e \
       "SELECT unique_key, complaint_type, agency, borough, status, kafka_partition, kafka_offset
        FROM nyc311_streams.service_requests LIMIT 5;"
     exit 0
   fi
-  echo "waiting for user rows in Cassandra (${attempt}/60)"
+  echo "waiting for NYC 311 rows in Cassandra (${attempt}/60)"
   sleep 5
 done
 
-echo "no user rows arrived in Cassandra" >&2
+echo "no NYC 311 rows arrived in Cassandra" >&2
 "${compose[@]}" logs --no-color --tail=150 spark-streaming >&2 || true
 exit 1

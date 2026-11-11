@@ -1,13 +1,17 @@
-"""Validate and normalize NYC 311 records into the Kafka message contract."""
+"""Validate and normalize NYC 311 records into the Kafka message contract.
+
+Source timestamps are NYC wall-clock time with no zone; every timestamp in the
+message is converted to UTC and written with a `Z` suffix.
+"""
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any
 
-from nyc311_stream.nyc311 import NYC311Error, parse_api_timestamp
+from nyc311_stream.nyc311 import NYC311Error, parse_fixed, parse_floating
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class InvalidRecord(ValueError):
@@ -29,6 +33,10 @@ def _required_text(record: dict[str, Any], key: str) -> str:
     return value
 
 
+def _utc(moment: datetime) -> str:
+    return moment.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
 def _timestamp(record: dict[str, Any], key: str, *, required: bool = False) -> str | None:
     value = _optional_text(record, key)
     if value is None:
@@ -36,10 +44,19 @@ def _timestamp(record: dict[str, Any], key: str, *, required: bool = False) -> s
             raise InvalidRecord(f"missing required field: {key}")
         return None
     try:
-        parsed = parse_api_timestamp(value)
+        return _utc(parse_floating(value))
     except NYC311Error:
         raise InvalidRecord(f"invalid timestamp in field: {key}") from None
-    return parsed.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _source_updated_at(record: dict[str, Any]) -> str | None:
+    value = _optional_text(record, ":updated_at")
+    if value is None:
+        return None
+    try:
+        return _utc(parse_fixed(value))
+    except NYC311Error:
+        raise InvalidRecord("invalid timestamp in field: :updated_at") from None
 
 
 def _optional_float(record: dict[str, Any], key: str) -> float | None:
@@ -52,15 +69,12 @@ def _optional_float(record: dict[str, Any], key: str) -> float | None:
         raise InvalidRecord(f"invalid numeric field: {key}") from None
 
 
-def format_request(raw: dict[str, Any], now: datetime | None = None) -> dict[str, Any]:
+def format_request(raw: dict[str, Any]) -> dict[str, Any]:
     """Return a stable, typed message for one NYC 311 service request."""
     if not isinstance(raw, dict):
         raise InvalidRecord(f"record is not an object: {type(raw).__name__}")
 
     created_date = _timestamp(raw, "created_date", required=True)
-    if now is not None:
-        # `now` is accepted for deterministic tests and future audit fields.
-        now.astimezone(UTC)
     return {
         "schema_version": SCHEMA_VERSION,
         "unique_key": _required_text(raw, "unique_key"),
@@ -81,5 +95,7 @@ def format_request(raw: dict[str, Any], now: datetime | None = None) -> dict[str
         "longitude": _optional_float(raw, "longitude"),
         "community_board": _optional_text(raw, "community_board"),
         "council_district": _optional_text(raw, "council_district"),
+        # When NYC last changed this row; Spark keeps the newest version of each key.
+        "source_updated_at": _source_updated_at(raw),
         "event_time": created_date,
     }

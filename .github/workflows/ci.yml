@@ -36,8 +36,9 @@ jobs:
     timeout-minutes: 35
     needs: unit
     env:
-      # Keeps the scheduled run that fires on unpause short as well.
-      STREAM_DURATION_SECONDS: "15"
+      # Unpausing also fires a scheduled run; keep it as small as the triggered one.
+      MAX_RECORDS_PER_RUN: "300"
+      REFRESH_WINDOW_DAYS: "2"
     steps:
       - uses: actions/checkout@v4
       - run: docker compose config --quiet

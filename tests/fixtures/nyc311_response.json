@@ -17,7 +17,8 @@
     "latitude": "40.7505",
     "longitude": "-73.9972",
     "community_board": "05",
-    "council_district": "03"
+    "council_district": "03",
+    ":updated_at": "2026-11-11T02:39:47.123Z"
   },
   {
     "unique_key": "70000002",
@@ -34,6 +35,7 @@
     "latitude": "40.7180",
     "longitude": "-73.9570",
     "community_board": "01",
-    "council_district": "34"
+    "council_district": "34",
+    ":updated_at": "2026-11-11T02:39:47.123Z"
   }
 ]

@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS nyc311_streams.service_requests (
   longitude double,
   community_board text,
   council_district text,
+  source_updated_at timestamp,
   event_time timestamp,
   kafka_partition int,
   kafka_offset bigint,

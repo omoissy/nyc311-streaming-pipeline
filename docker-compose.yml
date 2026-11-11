@@ -20,9 +20,10 @@ x-airflow-common: &airflow-common
     KAFKA_BOOTSTRAP_SERVERS: kafka:29092
     KAFKA_TOPIC: ${KAFKA_TOPIC:-nyc311_requests}
     KAFKA_DLQ_TOPIC: ${KAFKA_DLQ_TOPIC:-nyc311_requests_dlq}
-    API_BATCH_SIZE: ${API_BATCH_SIZE:-100}
-    MAX_RECORDS_PER_RUN: ${MAX_RECORDS_PER_RUN:-500}
-    INITIAL_LOOKBACK_HOURS: ${INITIAL_LOOKBACK_HOURS:-168}
+    API_BATCH_SIZE: ${API_BATCH_SIZE:-5000}
+    MAX_RECORDS_PER_RUN: ${MAX_RECORDS_PER_RUN:-100000}
+    REFRESH_WINDOW_DAYS: ${REFRESH_WINDOW_DAYS:-7}
+    NYC311_APP_TOKEN: ${NYC311_APP_TOKEN:-}
     PIPELINE_DB_URL: postgresql://airflow:airflow@postgres/airflow
   volumes:
     - ./dags:/opt/airflow/dags

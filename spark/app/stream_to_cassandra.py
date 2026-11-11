@@ -1,4 +1,10 @@
-"""Spark Structured Streaming job: Kafka NYC 311 events -> Cassandra."""
+"""Spark Structured Streaming job: Kafka NYC 311 events -> Cassandra.
+
+Each daily NYC load re-sends recent requests, so a micro-batch can hold several
+versions of one request. Only the newest (by `source_updated_at`, then Kafka offset)
+is written; Cassandra upserts it on `unique_key`. Kafka keys messages by
+`unique_key`, so versions of a request stay ordered across micro-batches.
+"""
 
 from __future__ import annotations
 
@@ -7,7 +13,7 @@ import os
 from dataclasses import dataclass
 from functools import partial
 
-from pyspark.sql import Column, DataFrame, SparkSession
+from pyspark.sql import Column, DataFrame, SparkSession, Window
 from pyspark.sql import functions as F
 from pyspark.sql.streaming import StreamingQueryListener
 from pyspark.sql.types import DoubleType, IntegerType, StringType, StructField, StructType
@@ -15,7 +21,6 @@ from pyspark.sql.types import DoubleType, IntegerType, StringType, StructField, 
 log = logging.getLogger("nyc311_to_cassandra")
 
 CORRUPT_RECORD = "_corrupt_record"
-UUID_PATTERN = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 
 REQUEST_SCHEMA = StructType(
     [
@@ -38,6 +43,7 @@ REQUEST_SCHEMA = StructType(
         StructField("longitude", DoubleType()),
         StructField("community_board", StringType()),
         StructField("council_district", StringType()),
+        StructField("source_updated_at", StringType()),
         StructField("event_time", StringType()),
         StructField(CORRUPT_RECORD, StringType()),
     ]
@@ -63,6 +69,7 @@ REQUEST_COLUMNS = [
     "longitude",
     "community_board",
     "council_district",
+    "source_updated_at",
     "event_time",
     "kafka_partition",
     "kafka_offset",
@@ -165,13 +172,20 @@ def parse_requests(kafka_df: DataFrame) -> DataFrame:
         data["longitude"].alias("longitude"),
         data["community_board"].alias("community_board"),
         data["council_district"].alias("council_district"),
+        F.to_timestamp(data["source_updated_at"]).alias("source_updated_at"),
         F.to_timestamp(data["event_time"]).alias("event_time"),
     )
 
 
 def valid_requests(parsed: DataFrame) -> DataFrame:
+    """Valid rows, one per `unique_key`: the newest version in this batch."""
+    newest_first = Window.partitionBy("unique_key").orderBy(
+        F.col("source_updated_at").desc_nulls_last(), F.col("kafka_offset").desc()
+    )
     return (
         parsed.filter(F.col("error").isNull())
+        .withColumn("_version_rank", F.row_number().over(newest_first))
+        .filter(F.col("_version_rank") == 1)
         .withColumn("ingested_at", F.current_timestamp())
         .select(*REQUEST_COLUMNS)
     )

@@ -1,9 +1,11 @@
 """
 ### nyc311_stream
 
-Incrementally ingests real NYC 311 service requests from NYC Open Data into Kafka.
-Kafka is the durable event boundary; Spark Structured Streaming validates and writes
-the events into Cassandra. Postgres stores the source cursor and an ingestion audit.
+Ingests real NYC 311 service requests from NYC Open Data into Kafka. Each run checks
+when NYC last loaded data; after a new load it re-reads every request created in the
+last `refresh_window_days`, so new requests, late arrivals and status/closure changes
+all reach Cassandra (upserted on `unique_key`). Without a new load the run is a no-op.
+Postgres stores the refresh progress and an audit row for every run, including failures.
 """
 
 from __future__ import annotations
@@ -18,14 +20,14 @@ from airflow.models.param import Param
 
 log = logging.getLogger(__name__)
 
-DEFAULT_MAX_RECORDS = int(os.getenv("MAX_RECORDS_PER_RUN", "500"))
-DEFAULT_LOOKBACK_HOURS = int(os.getenv("INITIAL_LOOKBACK_HOURS", "168"))
+DEFAULT_MAX_RECORDS = int(os.getenv("MAX_RECORDS_PER_RUN", "100000"))
+DEFAULT_WINDOW_DAYS = int(os.getenv("REFRESH_WINDOW_DAYS", "7"))
 MAX_REJECT_RATIO = float(os.getenv("MAX_REJECT_RATIO", "0.2"))
 
 
 @dag(
     dag_id="nyc311_stream",
-    description="Incrementally ingest NYC 311 service requests into Kafka",
+    description="Refresh recent NYC 311 service requests into Kafka after each NYC load",
     schedule="@hourly",
     start_date=datetime(2026, 1, 1),
     catchup=False,
@@ -41,15 +43,15 @@ MAX_REJECT_RATIO = float(os.getenv("MAX_REJECT_RATIO", "0.2"))
             DEFAULT_MAX_RECORDS,
             type="integer",
             minimum=1,
-            maximum=5000,
-            description="Maximum new NYC 311 records to fetch in this run",
+            maximum=500_000,
+            description="Maximum records to fetch; a capped refresh resumes next run",
         ),
-        "initial_lookback_hours": Param(
-            DEFAULT_LOOKBACK_HOURS,
+        "refresh_window_days": Param(
+            DEFAULT_WINDOW_DAYS,
             type="integer",
             minimum=1,
-            maximum=720,
-            description="Lookback used only on the first run without a Postgres cursor",
+            maximum=30,
+            description="Days of requests to re-read after a new NYC data load",
         ),
     },
     tags=["nyc311", "streaming", "kafka", "spark", "cassandra"],
@@ -67,7 +69,7 @@ def nyc311_stream():
             {settings.topic: settings.topic_partitions, settings.dlq_topic: 1},
         )
 
-    @task(execution_timeout=timedelta(minutes=10))
+    @task(execution_timeout=timedelta(minutes=50))
     def ingest_nyc311() -> dict:
         from airflow.operators.python import get_current_context
         from nyc311_stream.config import Settings
@@ -77,14 +79,14 @@ def nyc311_stream():
         return run_ingestion(
             Settings.from_env(),
             max_records=params["max_records"],
-            initial_lookback_hours=params["initial_lookback_hours"],
+            refresh_window_days=params["refresh_window_days"],
         )
 
     @task
     def quality_gate(stats: dict) -> None:
         log.info("NYC 311 ingestion stats: %s", stats)
         if stats["fetched"] == 0:
-            log.info("No new NYC 311 records were available; this is a healthy no-op run")
+            log.info("No new NYC data was loaded since the last refresh; healthy no-op")
             return
         reject_ratio = stats["dead_lettered"] / stats["fetched"]
         if reject_ratio > MAX_REJECT_RATIO:

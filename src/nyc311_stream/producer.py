@@ -1,39 +1,39 @@
-"""Publish normalized NYC 311 events to Kafka with a durable source cursor."""
+"""Publish NYC 311 requests to Kafka, refreshing recent requests after each NYC data load."""
 
 from __future__ import annotations
 
 import json
 import logging
-import time
 import uuid
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from confluent_kafka import KafkaError, KafkaException, Producer
 from confluent_kafka.admin import AdminClient, NewTopic
 
 from nyc311_stream.config import Settings
-from nyc311_stream.nyc311 import Cursor, NYC311Client, latest_cursor
-from nyc311_stream.state import PostgresStateStore
+from nyc311_stream.nyc311 import Cursor, NYC311Client, build_session, cursor_after, window_start
+from nyc311_stream.state import PostgresStateStore, RefreshState
 from nyc311_stream.transform import InvalidRecord, format_request
 
 log = logging.getLogger(__name__)
 
 
-class CursorStore(Protocol):
+class StateStore(Protocol):
     def ensure_schema(self) -> None: ...
 
-    def get_cursor(self, source_name: str) -> Cursor | None: ...
+    def get_state(self, source_name: str) -> RefreshState | None: ...
 
-    def save_cursor(self, source_name: str, cursor_value: Cursor) -> None: ...
+    def save_state(self, source_name: str, state: RefreshState) -> None: ...
 
     def record_run(self, values: dict[str, Any]) -> None: ...
 
 
 @dataclass
 class StreamStats:
-    run_id: str
+    pages: int = 0
     fetched: int = 0
     produced: int = 0
     dead_lettered: int = 0
@@ -52,6 +52,15 @@ def build_producer(bootstrap_servers: str) -> Producer:
             "linger.ms": 50,
             "delivery.timeout.ms": 120_000,
         }
+    )
+
+
+def build_client(settings: Settings) -> NYC311Client:
+    return NYC311Client(
+        settings.api_url,
+        settings.metadata_url,
+        timeout=settings.api_timeout_seconds,
+        session=build_session(app_token=settings.app_token),
     )
 
 
@@ -94,25 +103,26 @@ def _produce(
             producer.produce(topic, key=key, value=payload, on_delivery=on_delivery)
             return
         except BufferError:
+            # Local queue is full: serve delivery callbacks so it drains, then retry.
             producer.poll(1)
 
 
-def stream_requests(
+def refresh_requests(
     client: NYC311Client,
     producer: Producer,
     settings: Settings,
+    start: str,
     cursor: Cursor | None,
     *,
-    limit: int | None = None,
-    initial_lookback_hours: int | None = None,
-) -> tuple[StreamStats, Cursor | None]:
-    run_id = str(uuid.uuid4())
-    stats = StreamStats(run_id=run_id)
-    records = client.fetch_requests(
-        cursor,
-        limit=limit or settings.max_records_per_run,
-        initial_lookback_hours=initial_lookback_hours or settings.initial_lookback_hours,
-    )
+    limit: int,
+) -> tuple[StreamStats, Cursor | None, bool]:
+    """Page through requests created since `start`, after `cursor`, publishing each one.
+
+    Returns the stats, the cursor of the last row read, and whether the window was
+    exhausted (False means `limit` was reached and the next run should resume).
+    Raises if any message is not acknowledged by Kafka.
+    """
+    stats = StreamStats()
 
     def on_delivery(err: KafkaError | None, msg: Any) -> None:
         if err:
@@ -121,70 +131,129 @@ def stream_requests(
         else:
             stats.delivered += 1
 
-    stats.fetched = len(records)
-    for raw in records:
-        try:
-            record = format_request(raw)
-        except InvalidRecord as exc:
-            _produce(
-                producer,
-                settings.dlq_topic,
-                str(raw.get("unique_key")) if raw.get("unique_key") else None,
-                {"error": str(exc), "payload": raw},
-                on_delivery,
-            )
-            stats.dead_lettered += 1
-            continue
-        _produce(producer, settings.topic, record["unique_key"], record, on_delivery)
-        stats.produced += 1
+    remaining = limit
+    complete = False
+    while remaining > 0:
+        page_size = min(settings.batch_size, remaining)
+        page = client.fetch_page(start, cursor, limit=page_size)
+        stats.pages += 1
+        stats.fetched += len(page)
+        for raw in page:
+            try:
+                record = format_request(raw)
+            except InvalidRecord as exc:
+                key = str(raw["unique_key"]) if raw.get("unique_key") else None
+                _produce(
+                    producer,
+                    settings.dlq_topic,
+                    key,
+                    {"error": str(exc), "payload": raw},
+                    on_delivery,
+                )
+                stats.dead_lettered += 1
+                continue
+            _produce(producer, settings.topic, record["unique_key"], record, on_delivery)
+            stats.produced += 1
+        producer.poll(0)
+        cursor = cursor_after(page) or cursor
+        remaining -= len(page)
+        if len(page) < page_size:
+            complete = True
+            break
 
     undelivered = producer.flush(settings.flush_timeout_seconds)
     if undelivered:
         raise RuntimeError(f"{undelivered} messages still undelivered after flush")
     if stats.delivery_failures:
         raise RuntimeError(f"{stats.delivery_failures} messages failed delivery")
-    return stats, latest_cursor(records)
+    return stats, cursor, complete
 
 
 def run_ingestion(
     settings: Settings,
     *,
     max_records: int | None = None,
-    initial_lookback_hours: int | None = None,
+    refresh_window_days: int | None = None,
     client: NYC311Client | None = None,
     producer: Producer | None = None,
-    store: CursorStore | None = None,
-    now: Callable[[], float] = time.monotonic,
+    store: StateStore | None = None,
+    now: Callable[[], datetime] = lambda: datetime.now(UTC),
 ) -> dict[str, Any]:
-    del now  # retained as a seam for callers that instrument run timing
-    state = store or PostgresStateStore(settings.pipeline_db_url)
-    state.ensure_schema()
-    before = state.get_cursor(settings.source_name)
-    started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    client = client or NYC311Client(settings.api_url, timeout=settings.api_timeout_seconds)
-    producer = producer or build_producer(settings.bootstrap_servers)
-    stats, after = stream_requests(
-        client,
-        producer,
-        settings,
-        before,
-        limit=max_records,
-        initial_lookback_hours=initial_lookback_hours,
-    )
-    if after and (before is None or after > before):
-        state.save_cursor(settings.source_name, after)
-    state.record_run(
-        {
-            "run_id": stats.run_id,
-            "source_name": settings.source_name,
-            "started_at": started_at,
-            "fetched": stats.fetched,
-            "produced": stats.produced,
-            "dead_lettered": stats.dead_lettered,
-            "cursor_before": before,
-            "cursor_after": after,
-            "status": "success",
-        }
-    )
-    log.info("NYC 311 ingestion completed: %s", stats)
-    return {**asdict(stats), "cursor_after": asdict(after) if after else None}
+    """Run one ingestion step and record it in the audit table, whether it succeeds or not.
+
+    * NYC has not loaded new data since the last complete refresh: no-op.
+    * The last refresh stopped at the record cap: resume it from its cursor.
+    * NYC loaded new data: start a new refresh of the trailing window.
+
+    The refresh state is saved only after Kafka has acknowledged every message, so a
+    failed run is retried from the previous cursor. Re-sent requests are harmless
+    because Cassandra upserts on `unique_key`.
+    """
+    state_store = store or PostgresStateStore(settings.pipeline_db_url)
+    state_store.ensure_schema()
+    audit: dict[str, Any] = {
+        "run_id": str(uuid.uuid4()),
+        "source_name": settings.source_name,
+        "started_at": now(),
+    }
+    try:
+        client = client or build_client(settings)
+        version = client.source_version()
+        previous = state_store.get_state(settings.source_name)
+        audit["source_version"] = version
+
+        if previous and previous.source_version == version and previous.complete:
+            log.info("no new NYC data since %s; nothing to do", version.isoformat())
+            audit.update(status="no_change", window_start=previous.window_start)
+            state_store.record_run(audit)
+            return _result(audit, StreamStats(), complete=True)
+
+        if previous and previous.source_version == version:
+            start, cursor = previous.window_start, previous.cursor
+            log.info("resuming refresh for %s from %s", version.isoformat(), cursor)
+        else:
+            days = refresh_window_days or settings.refresh_window_days
+            start, cursor = window_start(now(), days), None
+            log.info("new NYC data at %s; refreshing requests since %s", version.isoformat(), start)
+        audit.update(window_start=start, cursor_before=cursor)
+
+        stats, after, complete = refresh_requests(
+            client,
+            producer or build_producer(settings.bootstrap_servers),
+            settings,
+            start,
+            cursor,
+            limit=max_records or settings.max_records_per_run,
+        )
+        state_store.save_state(settings.source_name, RefreshState(version, start, after, complete))
+        audit.update(
+            {key: getattr(stats, key) for key in AUDITED_COUNTS},
+            status="success",
+            cursor_after=after,
+            refresh_complete=complete,
+        )
+        state_store.record_run(audit)
+        log.info("NYC 311 ingestion finished: %s", audit)
+        return _result(audit, stats, complete=complete)
+    except Exception as exc:
+        audit.update(status="failed", error=f"{type(exc).__name__}: {exc}"[:2000])
+        try:
+            state_store.record_run(audit)
+        except Exception:
+            log.exception("could not record the failed run in the audit table")
+        raise
+
+
+AUDITED_COUNTS = ("pages", "fetched", "produced", "dead_lettered")
+
+
+def _result(audit: dict[str, Any], stats: StreamStats, *, complete: bool) -> dict[str, Any]:
+    """JSON-safe run summary, returned to Airflow as the task's XCom."""
+    summary: dict[str, Any] = {**asdict(stats), "refresh_complete": complete}
+    for key, value in audit.items():
+        if isinstance(value, datetime):
+            value = value.isoformat()
+        elif isinstance(value, Cursor):
+            value = asdict(value)
+        summary[key] = value
+    return summary

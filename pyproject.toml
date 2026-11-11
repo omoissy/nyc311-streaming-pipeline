@@ -12,6 +12,7 @@ dependencies = [
   "confluent-kafka==2.8.0",
   "psycopg2-binary==2.9.10",
   "requests==2.32.3",
+  "tzdata==2025.2",
 ]
 
 [project.optional-dependencies]
@@ -28,6 +29,7 @@ where = ["src"]
 pythonpath = ["src", "spark/app"]
 testpaths = ["tests"]
 addopts = "-q"
+markers = ["live: calls the real NYC Open Data API (set RUN_LIVE_TESTS=1)"]
 
 [tool.ruff]
 target-version = "py311"
